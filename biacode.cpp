@@ -43,9 +43,42 @@ protected:
 
 class BytesAsFOBitsOutBuf : public std::streambuf {
 public:
-  BytesAsFOBitsOutBuf(std::ostream &bytestream, int bytesperblock = 1);
+  BytesAsFOBitsOutBuf(std::ostream &bytestream, int bytesperblock = 1) : base(bytestream), segsize(0), reserve0(false), segfirst(0) {
+    blocksize = (bytesperblock > 0 ? bytesperblock : 1);
+    blockleft = 0;
+  }
+
   ~BytesAsFOBitsOutBuf() { End(); }
-  void End();
+
+  void End() {
+    sync();
+
+    if (!segsize)
+      segfirst = 0;
+
+  TOP:
+    for (; blockleft; --blockleft) {
+      reserve0 = reserve0 && !segfirst;
+      base.put(segfirst ^ 55);
+      segfirst = 0;
+    }
+
+    if (reserve0) {
+      assert(segfirst != 0);
+      if (segfirst != (char)128) {
+        reserve0 = false;
+        blockleft = blocksize;
+        goto TOP;
+      }
+    } else if (segfirst) {
+      blockleft = blocksize;
+      goto TOP;
+    }
+
+    segsize = 0;
+    reserve0 = false;
+    blockleft = 0;
+  }
 
 private:
   std::ostream &base;
@@ -54,8 +87,57 @@ private:
   char buf[256];
   char segfirst;
   bool reserve0;
-  virtual int overflow(int c);
-  virtual int sync();
+
+  virtual int overflow(int c) {
+    char *s, *e;
+
+    for (s = pbase(), e = pptr(); s != e; ++s) {
+      if (!segsize) {
+        segfirst = *s;
+        ++segsize;
+      } else if (!*s) {
+        ++segsize;
+      } else {
+        if (!blockleft) {
+          if (reserve0)
+            reserve0 = !(segfirst & 127);
+          else
+            reserve0 = !segfirst;
+          blockleft = blocksize - 1;
+        } else {
+          reserve0 = reserve0 && !segfirst;
+          --blockleft;
+        }
+
+        base.put(segfirst ^ 55);
+
+        for (--segsize; segsize; --segsize) {
+          if (!blockleft) {
+            reserve0 = true;
+            blockleft = blocksize - 1;
+          } else {
+            --blockleft;
+          }
+          base.put(55);
+        }
+
+        segfirst = *s;
+        ++segsize;
+      }
+    }
+
+    buf[0] = (char)c;
+    setp(buf, buf + 256);
+    if (c >= 0)
+      pbump(1);
+
+    return (c & 255);
+  }
+
+  virtual int sync() {
+    overflow(-1);
+    return 0;
+  }
 };
 
 //===========================================================================
@@ -64,7 +146,10 @@ private:
 
 class BytesAsFOBitsInBuf : public std::streambuf {
 public:
-  BytesAsFOBitsInBuf(std::istream &bytestream, int bytesperblock = 1);
+  BytesAsFOBitsInBuf(std::istream &bytestream, int bytesperblock = 1) : base(bytestream), blockleft(0), in_done(false), reserve0(false) {
+    blocksize = (bytesperblock > 0 ? bytesperblock : 1);
+    blockleft = 0;
+  }
 
 private:
   std::istream &base;
@@ -72,7 +157,53 @@ private:
   bool in_done;
   bool reserve0;
   char buf[256];
-  virtual int underflow();
+
+  virtual int underflow() {
+    char *s, *e;
+    int inbyte;
+
+    for (s = buf, e = buf + 256; (s != e); ++s) {
+      if (in_done) {
+        inbyte = 0;
+      } else {
+        inbyte = base.get();
+        if (inbyte < 0) {
+          in_done = true;
+          inbyte = 0;
+        } else {
+          inbyte ^= 55;
+        }
+      }
+
+      if (blockleft) {
+        reserve0 = reserve0 && !inbyte;
+        *s = (char)inbyte;
+        --blockleft;
+      } else if (in_done) {
+        if (reserve0) {
+          *s = (char)128;
+          reserve0 = false;
+        } else {
+          break;
+        }
+      } else {
+        if (reserve0)
+          reserve0 = !(inbyte & 127);
+        else
+          reserve0 = !inbyte;
+        blockleft = blocksize - 1;
+        *s = (char)inbyte;
+      }
+    }
+
+    if (s > buf) {
+      setg(buf, buf, s);
+      return (unsigned char)buf[0];
+    } else {
+      setg(0, 0, 0);
+      return -1;
+    }
+  }
 };
 
 //===========================================================================
@@ -105,12 +236,114 @@ private:
 
 class ArithmeticEncoder {
 public:
-  ArithmeticEncoder(std::ostream &outstream);
-  void Encode(const ArithmeticModel *model, int symbol, bool could_have_ended);
-  void End();
+  ArithmeticEncoder(std::ostream &outstream) : bytesout(outstream) {
+    low = 0;
+    range = BIT16;
+    intervalbits = 16;
+    freeendeven = MASK16;
+    nextfreeend = 0;
+    carrybyte = 0;
+    carrybuf = 0;
+  }
+
+  void Encode(const ArithmeticModel *model, int symbol, bool could_have_ended) {
+    U32 newh, newl;
+
+    if (could_have_ended) {
+      if (nextfreeend)
+        nextfreeend += (freeendeven + 1) << 1;
+      else
+        nextfreeend = freeendeven + 1;
+    }
+
+    model->GetSymRange(symbol, &newl, &newh);
+    newl = newl * range / model->ProbOne();
+    newh = newh * range / model->ProbOne();
+    range = newh - newl;
+    low += newl;
+
+    if (nextfreeend < low)
+      nextfreeend = ((low + freeendeven) & ~freeendeven) | (freeendeven + 1);
+
+    if (range <= (BIT16 >> 1)) {
+      low += low;
+      range += range;
+      nextfreeend += nextfreeend;
+      freeendeven += freeendeven + 1;
+
+      while (nextfreeend - low >= range) {
+        freeendeven >>= 1;
+        nextfreeend = ((low + freeendeven) & ~freeendeven) | (freeendeven + 1);
+      }
+
+      for (;;) {
+        if (++intervalbits == 24) {
+          newl = low & ~MASK16;
+          low -= newl;
+          nextfreeend -= newl;
+          freeendeven &= MASK16;
+          ByteWithCarry(newl >> 16);
+          intervalbits -= 8;
+        }
+
+        if (range > (BIT16 >> 1))
+          break;
+
+        low += low;
+        range += range;
+        nextfreeend += nextfreeend;
+        freeendeven += freeendeven + 1;
+      }
+      while (range <= (BIT16 >> 1))
+        ;
+    } else {
+      while (nextfreeend - low >= range) {
+        freeendeven >>= 1;
+        nextfreeend = ((low + freeendeven) & ~freeendeven) | (freeendeven + 1);
+      }
+    }
+  }
+
+  void End() {
+    nextfreeend <<= (24 - intervalbits);
+
+    while (nextfreeend) {
+      ByteWithCarry(nextfreeend >> 16);
+      nextfreeend = (nextfreeend & MASK16) << 8;
+    }
+
+    if (carrybuf)
+      ByteWithCarry(0);
+
+    low = 0;
+    range = BIT16;
+    intervalbits = 16;
+    freeendeven = MASK16;
+    nextfreeend = 0;
+    carrybyte = 0;
+    carrybuf = 0;
+  }
 
 private:
-  void ByteWithCarry(U32 byte);
+  void ByteWithCarry(U32 outbyte) {
+    if (carrybuf) {
+      if (outbyte >= 256) {
+        bytesout.put((char)(carrybyte + 1));
+        while (--carrybuf)
+          bytesout.put(0);
+        carrybyte = (BYTE)outbyte;
+      } else if (outbyte < 255) {
+        bytesout.put((char)carrybyte);
+        while (--carrybuf)
+          bytesout.put((char)255);
+        carrybyte = (BYTE)outbyte;
+      }
+    } else {
+      carrybyte = (BYTE)outbyte;
+    }
+    ++carrybuf;
+  }
+
   std::ostream &bytesout;
   U32 low, range;
   int intervalbits;
@@ -126,8 +359,106 @@ private:
 
 class ArithmeticDecoder {
 public:
-  ArithmeticDecoder(std::istream &instream);
-  int Decode(const ArithmeticModel *model, bool can_end);
+  ArithmeticDecoder(std::istream &instream) : bytesin(instream) {
+    low = 0;
+    range = BIT16;
+    intervalbits = 16;
+    freeendeven = MASK16;
+    nextfreeend = 0;
+    value = 0;
+    valueshift = -24;
+    followbyte = 0;
+    followbuf = 1;
+  }
+
+  int Decode(const ArithmeticModel *model, bool can_end) {
+    int ret;
+    U32 newh, newl;
+
+    while (valueshift <= 0) {
+      value <<= 8;
+      valueshift += 8;
+
+      if (!--followbuf) {
+        value |= followbyte;
+
+        int cin;
+        do {
+          cin = bytesin.get();
+          if (cin < 0) {
+            followbuf = -1;
+            break;
+          }
+          ++followbuf;
+          followbyte = (BYTE)cin;
+        } while (!followbyte);
+      }
+    }
+
+    if (can_end) {
+      if ((followbuf < 0) && (((nextfreeend - low) << valueshift) == value))
+        return -1;
+
+      if (nextfreeend)
+        nextfreeend += (freeendeven + 1) << 1;
+      else
+        nextfreeend = freeendeven + 1;
+    }
+
+    newl = ((value >> valueshift) * model->ProbOne() + model->ProbOne() - 1) / range;
+    ret = model->GetSymbol(newl, &newl, &newh);
+
+    newl = newl * range / model->ProbOne();
+    newh = newh * range / model->ProbOne();
+
+    range = newh - newl;
+    value -= (newl << valueshift);
+    low += newl;
+
+    if (nextfreeend < low)
+      nextfreeend = ((low + freeendeven) & ~freeendeven) | (freeendeven + 1);
+
+    if (range <= (BIT16 >> 1)) {
+      low += low;
+      range += range;
+      nextfreeend += nextfreeend;
+      freeendeven += freeendeven + 1;
+      --valueshift;
+
+      while (nextfreeend - low >= range) {
+        freeendeven >>= 1;
+        nextfreeend = ((low + freeendeven) & ~freeendeven) | (freeendeven + 1);
+      }
+
+      for (;;) {
+        if (++intervalbits == 24) {
+          newl = low & ~MASK16;
+          low -= newl;
+          nextfreeend -= newl;
+          freeendeven &= MASK16;
+          intervalbits -= 8;
+        }
+
+        if (range > (BIT16 >> 1))
+          break;
+
+        low += low;
+        range += range;
+        nextfreeend += nextfreeend;
+        freeendeven += freeendeven + 1;
+        --valueshift;
+      }
+      while (range <= (BIT16 >> 1))
+        ;
+    } else {
+      while (nextfreeend - low >= range) {
+        freeendeven >>= 1;
+        nextfreeend = ((low + freeendeven) & ~freeendeven) | (freeendeven + 1);
+      }
+    }
+
+    return ret;
+  }
 
 private:
   std::istream &bytesin;
@@ -147,516 +478,141 @@ private:
 
 class SimpleAdaptiveModel : public ArithmeticModel {
 public:
-  SimpleAdaptiveModel(int numsymbols);
-  ~SimpleAdaptiveModel();
-  void Update(int symbol);
-  void Reset();
-  virtual void GetSymRange(int symbol, U32 *newlow, U32 *newhigh) const;
-  virtual int GetSymbol(U32 p, U32 *newlow, U32 *newhigh) const;
+  SimpleAdaptiveModel(int numsymbols) {
+    int i;
+
+    for (symzeroindex = 1; symzeroindex < numsymbols; symzeroindex += symzeroindex)
+      ;
+
+    probheap = new U32[symzeroindex << 1];
+    for (i = symzeroindex << 1; i--;)
+      probheap[i] = 0;
+    prob1 = 0;
+
+    for (i = numsymbols; i--;)
+      AddP(i, 1);
+
+    for (i = 4096; i--;)
+      window[i] = -1;
+
+    w0 = window;
+    w1 = w0 + 1024;
+    w2 = w0 + 2048;
+    w3 = w0 + 3072;
+  }
+
+  ~SimpleAdaptiveModel() { delete[] probheap; }
+
+  void Update(int symbol) {
+    w1 = ((w1 == window) ? w1 + 4095 : w1 - 1);
+    if (*w1 >= 0)
+      SubP(*w1, 2);
+
+    w2 = ((w2 == window) ? w2 + 4095 : w2 - 1);
+    if (*w2 >= 0)
+      SubP(*w2, 1);
+
+    w3 = ((w3 == window) ? w3 + 4095 : w3 - 1);
+    if (*w3 >= 0)
+      SubP(*w3, 1);
+
+    w0 = ((w0 == window) ? w0 + 4095 : w0 - 1);
+    if (*w0 >= 0)
+      SubP(*w0, 2);
+
+    *w0 = symbol;
+    AddP(symbol, 6);
+  }
+
+  void Reset() {
+    int *w, *lim;
+    lim = window + 4095;
+
+    for (w = w0; w != w1; w = (w == lim ? window : w + 1)) {
+      if (*w < 0)
+        goto DONE;
+      SubP(*w, 6);
+      *w = -1;
+    }
+
+    for (w = w1; w != w2; w = (w == lim ? window : w + 1)) {
+      if (*w < 0)
+        goto DONE;
+      SubP(*w, 4);
+      *w = -1;
+    }
+
+    for (w = w2; w != w3; w = (w == lim ? window : w + 1)) {
+      if (*w < 0)
+        goto DONE;
+      SubP(*w, 3);
+      *w = -1;
+    }
+
+    for (w = w3; w != w0; w = (w == lim ? window : w + 1)) {
+      if (*w < 0)
+        goto DONE;
+      SubP(*w, 2);
+      *w = -1;
+    }
+
+  DONE:
+    return;
+  }
+
+  virtual void GetSymRange(int symbol, U32 *newlow, U32 *newhigh) const {
+    int i, bit = symzeroindex;
+    U32 low = 0;
+
+    for (i = 1; i < symzeroindex;) {
+      bit >>= 1;
+      i += i;
+
+      if (symbol & bit) {
+        low += probheap[i++];
+      }
+    }
+
+    *newlow = low;
+    *newhigh = low + probheap[i];
+  }
+
+  virtual int GetSymbol(U32 p, U32 *newlow, U32 *newhigh) const {
+    int i;
+    U32 low = 0;
+
+    for (i = 1; i < symzeroindex;) {
+      i += i;
+
+      if ((p - low) >= probheap[i]) {
+        low += probheap[i++];
+      }
+    }
+
+    *newlow = low;
+    *newhigh = low + probheap[i];
+    return (i - symzeroindex);
+  }
 
 private:
-  void AddP(int symbol, U32 n);
-  void SubP(int symbol, U32 n);
+  void AddP(int sym, U32 n) {
+    for (sym += symzeroindex; sym; sym >>= 1)
+      probheap[sym] += n;
+
+    prob1 = probheap[1];
+  }
+
+  void SubP(int sym, U32 n) {
+    for (sym += symzeroindex; sym; sym >>= 1)
+      probheap[sym] -= n;
+
+    prob1 = probheap[1];
+  }
+
   U32 *probheap;
   int symzeroindex;
   int window[4096], *w0, *w1, *w2, *w3;
 };
-
-//===========================================================================
-// ArithmeticEncoder Implementation
-//===========================================================================
-
-ArithmeticEncoder::ArithmeticEncoder(std::ostream &outstream) : bytesout(outstream) {
-  low = 0;
-  range = BIT16;
-  intervalbits = 16;
-  freeendeven = MASK16;
-  nextfreeend = 0;
-  carrybyte = 0;
-  carrybuf = 0;
-}
-
-void ArithmeticEncoder::Encode(const ArithmeticModel *model, int symbol, bool could_have_ended) {
-  U32 newh, newl;
-
-  if (could_have_ended) {
-    if (nextfreeend)
-      nextfreeend += (freeendeven + 1) << 1;
-    else
-      nextfreeend = freeendeven + 1;
-  }
-
-  model->GetSymRange(symbol, &newl, &newh);
-  newl = newl * range / model->ProbOne();
-  newh = newh * range / model->ProbOne();
-  range = newh - newl;
-  low += newl;
-
-  if (nextfreeend < low)
-    nextfreeend = ((low + freeendeven) & ~freeendeven) | (freeendeven + 1);
-
-  if (range <= (BIT16 >> 1)) {
-    low += low;
-    range += range;
-    nextfreeend += nextfreeend;
-    freeendeven += freeendeven + 1;
-
-    while (nextfreeend - low >= range) {
-      freeendeven >>= 1;
-      nextfreeend = ((low + freeendeven) & ~freeendeven) | (freeendeven + 1);
-    }
-
-    for (;;) {
-      if (++intervalbits == 24) {
-        newl = low & ~MASK16;
-        low -= newl;
-        nextfreeend -= newl;
-        freeendeven &= MASK16;
-        ByteWithCarry(newl >> 16);
-        intervalbits -= 8;
-      }
-
-      if (range > (BIT16 >> 1))
-        break;
-
-      low += low;
-      range += range;
-      nextfreeend += nextfreeend;
-      freeendeven += freeendeven + 1;
-    }
-    while (range <= (BIT16 >> 1))
-      ;
-  } else {
-    while (nextfreeend - low >= range) {
-      freeendeven >>= 1;
-      nextfreeend = ((low + freeendeven) & ~freeendeven) | (freeendeven + 1);
-    }
-  }
-}
-
-void ArithmeticEncoder::End() {
-  nextfreeend <<= (24 - intervalbits);
-
-  while (nextfreeend) {
-    ByteWithCarry(nextfreeend >> 16);
-    nextfreeend = (nextfreeend & MASK16) << 8;
-  }
-
-  if (carrybuf)
-    ByteWithCarry(0);
-
-  low = 0;
-  range = BIT16;
-  intervalbits = 16;
-  freeendeven = MASK16;
-  nextfreeend = 0;
-  carrybyte = 0;
-  carrybuf = 0;
-}
-
-inline void ArithmeticEncoder::ByteWithCarry(U32 outbyte) {
-  if (carrybuf) {
-    if (outbyte >= 256) {
-      bytesout.put((char)(carrybyte + 1));
-      while (--carrybuf)
-        bytesout.put(0);
-      carrybyte = (BYTE)outbyte;
-    } else if (outbyte < 255) {
-      bytesout.put((char)carrybyte);
-      while (--carrybuf)
-        bytesout.put((char)255);
-      carrybyte = (BYTE)outbyte;
-    }
-  } else {
-    carrybyte = (BYTE)outbyte;
-  }
-  ++carrybuf;
-}
-
-//===========================================================================
-// ArithmeticDecoder Implementation
-//===========================================================================
-
-ArithmeticDecoder::ArithmeticDecoder(std::istream &instream) : bytesin(instream) {
-  low = 0;
-  range = BIT16;
-  intervalbits = 16;
-  freeendeven = MASK16;
-  nextfreeend = 0;
-  value = 0;
-  valueshift = -24;
-  followbyte = 0;
-  followbuf = 1;
-}
-
-int ArithmeticDecoder::Decode(const ArithmeticModel *model, bool can_end) {
-  int ret;
-  U32 newh, newl;
-
-  while (valueshift <= 0) {
-    value <<= 8;
-    valueshift += 8;
-
-    if (!--followbuf) {
-      value |= followbyte;
-
-      int cin;
-      do {
-        cin = bytesin.get();
-        if (cin < 0) {
-          followbuf = -1;
-          break;
-        }
-        ++followbuf;
-        followbyte = (BYTE)cin;
-      } while (!followbyte);
-    }
-  }
-
-  if (can_end) {
-    if ((followbuf < 0) && (((nextfreeend - low) << valueshift) == value))
-      return -1;
-
-    if (nextfreeend)
-      nextfreeend += (freeendeven + 1) << 1;
-    else
-      nextfreeend = freeendeven + 1;
-  }
-
-  newl = ((value >> valueshift) * model->ProbOne() + model->ProbOne() - 1) / range;
-  ret = model->GetSymbol(newl, &newl, &newh);
-
-  newl = newl * range / model->ProbOne();
-  newh = newh * range / model->ProbOne();
-
-  range = newh - newl;
-  value -= (newl << valueshift);
-  low += newl;
-
-  if (nextfreeend < low)
-    nextfreeend = ((low + freeendeven) & ~freeendeven) | (freeendeven + 1);
-
-  if (range <= (BIT16 >> 1)) {
-    low += low;
-    range += range;
-    nextfreeend += nextfreeend;
-    freeendeven += freeendeven + 1;
-    --valueshift;
-
-    while (nextfreeend - low >= range) {
-      freeendeven >>= 1;
-      nextfreeend = ((low + freeendeven) & ~freeendeven) | (freeendeven + 1);
-    }
-
-    for (;;) {
-      if (++intervalbits == 24) {
-        newl = low & ~MASK16;
-        low -= newl;
-        nextfreeend -= newl;
-        freeendeven &= MASK16;
-        intervalbits -= 8;
-      }
-
-      if (range > (BIT16 >> 1))
-        break;
-
-      low += low;
-      range += range;
-      nextfreeend += nextfreeend;
-      freeendeven += freeendeven + 1;
-      --valueshift;
-    }
-    while (range <= (BIT16 >> 1))
-      ;
-  } else {
-    while (nextfreeend - low >= range) {
-      freeendeven >>= 1;
-      nextfreeend = ((low + freeendeven) & ~freeendeven) | (freeendeven + 1);
-    }
-  }
-
-  return ret;
-}
-
-//===========================================================================
-// BytesAsFOBitsOutBuf Implementation
-//===========================================================================
-
-BytesAsFOBitsOutBuf::BytesAsFOBitsOutBuf(std::ostream &bytestream, int bytesperblock) : base(bytestream), segsize(0), reserve0(false), segfirst(0) {
-  blocksize = (bytesperblock > 0 ? bytesperblock : 1);
-  blockleft = 0;
-}
-
-int BytesAsFOBitsOutBuf::overflow(int c) {
-  char *s, *e;
-
-  for (s = pbase(), e = pptr(); s != e; ++s) {
-    if (!segsize) {
-      segfirst = *s;
-      ++segsize;
-    } else if (!*s) {
-      ++segsize;
-    } else {
-      if (!blockleft) {
-        if (reserve0)
-          reserve0 = !(segfirst & 127);
-        else
-          reserve0 = !segfirst;
-        blockleft = blocksize - 1;
-      } else {
-        reserve0 = reserve0 && !segfirst;
-        --blockleft;
-      }
-
-      base.put(segfirst ^ 55);
-
-      for (--segsize; segsize; --segsize) {
-        if (!blockleft) {
-          reserve0 = true;
-          blockleft = blocksize - 1;
-        } else {
-          --blockleft;
-        }
-        base.put(55);
-      }
-
-      segfirst = *s;
-      ++segsize;
-    }
-  }
-
-  buf[0] = (char)c;
-  setp(buf, buf + 256);
-  if (c >= 0)
-    pbump(1);
-
-  return (c & 255);
-}
-
-int BytesAsFOBitsOutBuf::sync() {
-  overflow(-1);
-  return 0;
-}
-
-void BytesAsFOBitsOutBuf::End() {
-  sync();
-
-  if (!segsize)
-    segfirst = 0;
-
-TOP:
-  for (; blockleft; --blockleft) {
-    reserve0 = reserve0 && !segfirst;
-    base.put(segfirst ^ 55);
-    segfirst = 0;
-  }
-
-  if (reserve0) {
-    assert(segfirst != 0);
-    if (segfirst != (char)128) {
-      reserve0 = false;
-      blockleft = blocksize;
-      goto TOP;
-    }
-  } else if (segfirst) {
-    blockleft = blocksize;
-    goto TOP;
-  }
-
-  segsize = 0;
-  reserve0 = false;
-  blockleft = 0;
-}
-
-//===========================================================================
-// BytesAsFOBitsInBuf Implementation
-//===========================================================================
-
-BytesAsFOBitsInBuf::BytesAsFOBitsInBuf(std::istream &bytestream, int bytesperblock) : base(bytestream), blockleft(0), in_done(false), reserve0(false) {
-  blocksize = (bytesperblock > 0 ? bytesperblock : 1);
-  blockleft = 0;
-}
-
-int BytesAsFOBitsInBuf::underflow() {
-  char *s, *e;
-  int inbyte;
-
-  for (s = buf, e = buf + 256; (s != e); ++s) {
-    if (in_done) {
-      inbyte = 0;
-    } else {
-      inbyte = base.get();
-      if (inbyte < 0) {
-        in_done = true;
-        inbyte = 0;
-      } else {
-        inbyte ^= 55;
-      }
-    }
-
-    if (blockleft) {
-      reserve0 = reserve0 && !inbyte;
-      *s = (char)inbyte;
-      --blockleft;
-    } else if (in_done) {
-      if (reserve0) {
-        *s = (char)128;
-        reserve0 = false;
-      } else {
-        break;
-      }
-    } else {
-      if (reserve0)
-        reserve0 = !(inbyte & 127);
-      else
-        reserve0 = !inbyte;
-      blockleft = blocksize - 1;
-      *s = (char)inbyte;
-    }
-  }
-
-  if (s > buf) {
-    setg(buf, buf, s);
-    return (unsigned char)buf[0];
-  } else {
-    setg(0, 0, 0);
-    return -1;
-  }
-}
-
-//===========================================================================
-// SimpleAdaptiveModel Implementation
-//===========================================================================
-
-SimpleAdaptiveModel::SimpleAdaptiveModel(int numsymbols) {
-  int i;
-
-  for (symzeroindex = 1; symzeroindex < numsymbols; symzeroindex += symzeroindex)
-    ;
-
-  probheap = new U32[symzeroindex << 1];
-  for (i = symzeroindex << 1; i--;)
-    probheap[i] = 0;
-  prob1 = 0;
-
-  for (i = numsymbols; i--;)
-    AddP(i, 1);
-
-  for (i = 4096; i--;)
-    window[i] = -1;
-
-  w0 = window;
-  w1 = w0 + 1024;
-  w2 = w0 + 2048;
-  w3 = w0 + 3072;
-}
-
-SimpleAdaptiveModel::~SimpleAdaptiveModel() { delete[] probheap; }
-
-void SimpleAdaptiveModel::Update(int symbol) {
-  w1 = ((w1 == window) ? w1 + 4095 : w1 - 1);
-  if (*w1 >= 0)
-    SubP(*w1, 2);
-
-  w2 = ((w2 == window) ? w2 + 4095 : w2 - 1);
-  if (*w2 >= 0)
-    SubP(*w2, 1);
-
-  w3 = ((w3 == window) ? w3 + 4095 : w3 - 1);
-  if (*w3 >= 0)
-    SubP(*w3, 1);
-
-  w0 = ((w0 == window) ? w0 + 4095 : w0 - 1);
-  if (*w0 >= 0)
-    SubP(*w0, 2);
-
-  *w0 = symbol;
-  AddP(symbol, 6);
-}
-
-void SimpleAdaptiveModel::Reset() {
-  int *w, *lim;
-  lim = window + 4095;
-
-  for (w = w0; w != w1; w = (w == lim ? window : w + 1)) {
-    if (*w < 0)
-      goto DONE;
-    SubP(*w, 6);
-    *w = -1;
-  }
-
-  for (w = w1; w != w2; w = (w == lim ? window : w + 1)) {
-    if (*w < 0)
-      goto DONE;
-    SubP(*w, 4);
-    *w = -1;
-  }
-
-  for (w = w2; w != w3; w = (w == lim ? window : w + 1)) {
-    if (*w < 0)
-      goto DONE;
-    SubP(*w, 3);
-    *w = -1;
-  }
-
-  for (w = w3; w != w0; w = (w == lim ? window : w + 1)) {
-    if (*w < 0)
-      goto DONE;
-    SubP(*w, 2);
-    *w = -1;
-  }
-
-DONE:
-  return;
-}
-
-void SimpleAdaptiveModel::GetSymRange(int symbol, U32 *newlow, U32 *newhigh) const {
-  int i, bit = symzeroindex;
-  U32 low = 0;
-
-  for (i = 1; i < symzeroindex;) {
-    bit >>= 1;
-    i += i;
-
-    if (symbol & bit) {
-      low += probheap[i++];
-    }
-  }
-
-  *newlow = low;
-  *newhigh = low + probheap[i];
-}
-
-int SimpleAdaptiveModel::GetSymbol(U32 p, U32 *newlow, U32 *newhigh) const {
-  int i;
-  U32 low = 0;
-
-  for (i = 1; i < symzeroindex;) {
-    i += i;
-
-    if ((p - low) >= probheap[i]) {
-      low += probheap[i++];
-    }
-  }
-
-  *newlow = low;
-  *newhigh = low + probheap[i];
-  return (i - symzeroindex);
-}
-
-void SimpleAdaptiveModel::AddP(int sym, U32 n) {
-  for (sym += symzeroindex; sym; sym >>= 1)
-    probheap[sym] += n;
-
-  prob1 = probheap[1];
-}
-
-void SimpleAdaptiveModel::SubP(int sym, U32 n) {
-  for (sym += symzeroindex; sym; sym >>= 1)
-    probheap[sym] -= n;
-
-  prob1 = probheap[1];
-}
 
 static char *_callname;
 
