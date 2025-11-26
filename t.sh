@@ -4,28 +4,28 @@ set -e
 echo "Running tests..."
 
 echo "Test 1: arb255 compress arb255.cpp -> 1"
-./arb255 arb255.cpp 1
+./arb255 c arb255.cpp 1
 
-echo "Test 2: unarb255 decompress 1 -> 2"
-./unarb255 1 2
+echo "Test 2: arb255 decompress 1 -> 2"
+./arb255 d 1 2
 
-echo "Test 3: biacode encode arb255.cpp -> 3"
-./biacode arb255.cpp 3
+echo "Test 3: biacode compress arb255.cpp -> 3"
+./biacode c arb255.cpp 3
 
-echo "Test 4: biacode decode 3 -> 4"
-./biacode -d 3 4
+echo "Test 4: biacode decompress 3 -> 4"
+./biacode d 3 4
 
-echo "Test 5: unarb255 encode arb255.cpp -> 5"
-./unarb255 arb255.cpp 5
+echo "Test 5: arb255 compress arb255.cpp -> 5"
+./arb255 c arb255.cpp 5
 
-echo "Test 6: arb255 decode 5 -> 6"
-./arb255 5 6
+echo "Test 6: arb255 decompress 5 -> 6"
+./arb255 d 5 6
 
-echo "Test 7: biacode decode arb255.cpp -> 7"
-./biacode -d arb255.cpp 7
+echo "Test 7: biacode decompress arb255.cpp -> 7"
+./biacode d arb255.cpp 7
 
-echo "Test 8: biacode encode 7 -> 8"
-./biacode 7 8
+echo "Test 8: biacode compress 7 -> 8"
+./biacode c 7 8
 
 echo ""
 echo "Checking file hashes..."

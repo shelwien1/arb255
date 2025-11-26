@@ -201,20 +201,64 @@ void bit_plus_follow(int bit)
         dasw(1 ^ bit);
 }
 
+void usage(const char* progname)
+{
+    fprintf(stderr, "\nBijective Arithmetic 2 state coding version 20040723\n");
+    fprintf(stderr, "USAGE: %s c|d <infile> <outfile>\n\n", progname);
+    fprintf(stderr, "  c:  compress (bits to bytes)\n");
+    fprintf(stderr, "  d:  decompress (bytes to bits)\n\n");
+}
+
+void encode_file(FILE* f_inp, FILE* g_out);
+void decode_file(FILE* f_inp, FILE* g_out);
+
 int main(int argc, char *argv[])
+{
+    if (argc != 4) {
+        usage(argv[0]);
+        return 1;
+    }
+
+    char mode = argv[1][0];
+    if (mode != 'c' && mode != 'C' && mode != 'd' && mode != 'D') {
+        usage(argv[0]);
+        return 1;
+    }
+
+    // Open input and output files
+    FILE* f_inp = fopen(argv[2], "rb");
+    if (f_inp == 0) {
+        fprintf(stderr, "Could not open input file: %s\n", argv[2]);
+        return 1;
+    }
+
+    FILE* g_out = fopen(argv[3], "wb");
+    if (g_out == 0) {
+        fprintf(stderr, "Could not open output file: %s\n", argv[3]);
+        fclose(f_inp);
+        return 2;
+    }
+
+    if (mode == 'c' || mode == 'C') {
+        fprintf(stderr, "Bijective Arithmetic 2 state coding version 20040723\n");
+        fprintf(stderr, "Arithmetic of 256 symbols coding on ");
+        encode_file(f_inp, g_out);
+    } else {
+        fprintf(stderr, "Bijective Arithmetic 2 state uncoding version 20040723\n");
+        fprintf(stderr, "Arithmetic of 256 Symbols decoding on ");
+        decode_file(f_inp, g_out);
+    }
+
+    fclose(f_inp);
+    fclose(g_out);
+
+    return 0;
+}
+
+void encode_file(FILE* f_inp, FILE* g_out)
 {
     int ch;
     int ticker = 0;
-
-    fprintf(stderr, "Bijective Arithmetic 2 state coding version 20040723 \n ");
-    fprintf(stderr, "Arithmetic of 256 symbols coding on ");
-
-    // Open input and output files
-    FILE* f_inp = fopen(argv[1], "rb");
-    if (f_inp == 0) return 1;
-
-    FILE* g_out = fopen(argv[2], "wb");
-    if (g_out == 0) return 2;
 
     in.ir(f_inp);
     out.iw(g_out);
@@ -292,8 +336,6 @@ int main(int argc, char *argv[])
     fprintf(stderr, " SUCCESSFUL \n");
     if (FRXX == 1)
         fprintf(stderr, "BUT USED HIGH FREEENDS");
-
-    return 0;
 }
 
 /**
@@ -437,4 +479,300 @@ void encode_symbol(int symbol, bij_2c ff)
     }
 
     return;
+}
+
+// ==================== DECODER FUNCTIONS ====================
+
+int ZEND;              // Flag for last one bit in file
+code_value VALUE;      // Current decoded value
+
+/**
+ * Input a single bit from the stream
+ * Returns: 0 or 1 for normal bits, -1 for last bit, -2 thereafter
+ */
+inline int input_bit(void)
+{
+    int t;
+    t = in.rs();
+
+    if (t < 0) {
+        if (t == -1)
+            t = 1;
+        else
+            t = 0;
+        ZEND = 1;  // Mark end of input
+    }
+
+    return t;
+}
+
+/**
+ * Initialize the decoder by reading initial bits
+ *
+ * Algorithm:
+ * 1. Start with VALUE = 1
+ * 2. Read bits until VALUE >= Half (reach the valid range)
+ * 3. Subtract Half and read one more bit
+ * 4. Now VALUE is positioned correctly within [low, high]
+ */
+void start_decoding(void)
+{
+    VALUE = 1;
+    freeend = Half;
+    fcount = 1;
+    ZEND = 0;
+
+    // Read initial bits to fill VALUE
+    for (; VALUE < Half;) {
+        VALUE = 2 * VALUE + input_bit();
+    }
+
+    VALUE -= Half;
+    VALUE = 2 * VALUE + input_bit();
+}
+
+/**
+ * Decode the next symbol (0 or 1)
+ *
+ * Algorithm:
+ * 1. Check for end-of-stream (VALUE == freeend)
+ * 2. Split interval [low, high] based on symbol probabilities
+ * 3. Determine which portion VALUE falls into
+ * 4. That determines the decoded symbol
+ * 5. Narrow interval to that portion
+ * 6. Update free end (must match encoder)
+ * 7. Remove bits as interval narrows
+ *
+ * Returns: 0 or 1 for decoded symbol, -1 for end-of-stream
+ */
+code_value BBB = 100;
+
+int decode_symbol(bij_2c ff)
+{
+    code_value c, a, b;           // Interval calculation variables
+    code_value Fzero;             // Frequency of zero symbol
+    code_value oldlow, oldhigh;   // For validation
+    int LPS;                      // Less Probable Symbol (0 or 1)
+    static int EXX = 0;           // Error counter
+    int symbol = 0;               // Decoded symbol
+
+    oldlow = low;
+    oldhigh = high;
+
+    // Sanity check: ensure interval and free end are valid
+    if (high < low || freeend > high || freeend < low) {
+        fprintf(stderr, " STOP 1 impossible exit ");
+        exit(0);
+    }
+
+    // Check for end-of-stream: VALUE matches free end
+    if (ZEND == 1 && VALUE == freeend && FRX == 0)
+        return -1;  // EXIT DONE
+
+    // Additional end-of-stream validation
+    if (ZEND == 1 && FRX == 0 && ((VALUE == 0 && CMOD == 0) ||
+                                   (VALUE == Half && CMOD == 1))) {
+        fprintf(stderr, " STOP past end ");
+        EXX++;
+        if (EXX > 5) {
+            exit(0);
+        }
+    }
+
+    // Calculate interval size and split (must match encoder)
+    c = high - low;
+    a = c / ff.Ftot;
+    b = c - a * ff.Ftot;
+
+    Fzero = ff.Ftot - ff.Fone;
+
+    // Determine LPS and calculate its interval size (must match encoder)
+    if (Fzero > ff.Fone) {
+        LPS = 1;
+        a = a * ff.Fone + (b * ff.Fone) / ff.Ftot;
+    } else {
+        LPS = 0;
+        a = a * Fzero + (b * Fzero) / ff.Ftot;
+    }
+
+    // Ensure minimum interval size
+    if ((low + a) > (high - a))
+        a--;
+
+    // Determine which symbol was encoded based on VALUE position
+    // This must perfectly mirror the encoder's interval assignment
+    if (low >= First_qtr && (high - a) <= Third_qtr && (high - a) >= Half) {
+        // LPS at top of interval case
+        if (VALUE >= (high - a)) {
+            symbol = LPS;
+            low = high - a;
+        } else {
+            symbol = 1 - LPS;
+            high = (high - a) - 1;
+        }
+    } else {
+        // LPS at bottom of interval (normal case)
+        if (VALUE <= (low + a)) {
+            symbol = LPS;
+            high = low + a;
+        } else {
+            symbol = 1 - LPS;
+            low = low + a + 1;
+        }
+    }
+
+    /**
+     * Free End Management (must match encoder exactly)
+     *
+     * The decoder must track free ends identically to encoder
+     * to detect the end-of-stream marker correctly.
+     */
+    if (FRX != 0) {
+        fprintf(stderr, "\n HERE AT LAST ");
+        if (low > freeend)
+            freeend = low;
+        else if (freeend < high)
+            freeend += 1;
+        else {
+            fprintf(stderr, "\n NO FREE END SO FATAL ERROR ");
+            fprintf(stderr, "\n THIS SHOULD NOT HAPPEN ");
+            exit(0);
+        }
+    } else if (freeend == Top_value) {
+        freeend = low;
+        FRX = 1;
+    } else if (CMOD == 0 || (freeend | Half) != Half) {
+        inc_fre();
+    } else if (freeend == 0 || low != 0) {
+        freeend = Half;
+        inc_fre();
+    } else {
+        freeend = 0;
+    }
+
+    // Validation: interval must remain valid
+    if (high < low || low < oldlow || high > oldhigh) {
+        fprintf(stderr, " STOP 2 impossible exit ");
+        exit(0);
+    }
+
+    // Validation: VALUE must stay within interval
+    if (VALUE > high || VALUE < low) {
+        fprintf(stderr, " not possible high = %16.16llx VALUE = %16.16llx low = %16.16llx ",
+                high, VALUE, low);
+        exit(0);
+    }
+
+    /**
+     * Bit Removal Loop
+     *
+     * As the interval narrows, remove leading bits that are now determined.
+     * Must mirror encoder's bit output logic exactly.
+     */
+    for (;;) {
+        if (high < Half) {
+            // Entire interval in lower half
+            CMOD = 0;
+            // No adjustment needed for VALUE
+        } else if (low >= Half) {
+            // Entire interval in upper half
+            CMOD = 0;
+            VALUE -= Half;
+            freeend -= Half;
+            low -= Half;
+            high -= Half;
+        } else if (low >= First_qtr && high < Third_qtr) {
+            // Interval in middle - subtract offset
+            CMOD = 1;
+            VALUE -= First_qtr;
+            freeend -= First_qtr;
+            low -= First_qtr;
+            high -= First_qtr;
+        } else {
+            break;  // Can't remove bits yet
+        }
+
+        // Scale up interval and read next bit
+        low = 2 * low;
+        high = 2 * high + 1;
+        VALUE = 2 * VALUE + input_bit();
+        freeend = 2 * freeend + FRX;
+        FRX = 0;
+    }
+
+    return symbol;
+}
+
+void decode_file(FILE* f_inp, FILE* g_out)
+{
+    int ticker = 0;
+    int ch;
+
+    in.ir(f_inp);
+    out.iw(g_out);
+
+    // Initialize all 255 binary frequency models
+    // Must match encoder initialization exactly
+    for (cc = 255; cc-- > 0;) {
+        ff[cc].Fone = 1;
+        ff[cc].Ftot = 2;
+    }
+
+    // Initialize decoder state
+    cc = 0;
+    low = 0;
+    high = Top_value;
+    start_decoding();
+
+    // Main decoding loop - reconstruct original bit stream
+    for (;;) {
+        // Progress indicator
+        if ((ticker++ % 65536) == 0)
+            putc('.', stderr);
+
+        // Decode next bit using current context model
+        ch = decode_symbol(ff[cc]);
+        out.wz(ch);
+
+        if (ch == -1)
+            break;  // End of stream detected
+
+        // Update frequency model (must match encoder)
+        if (ch == 1)
+            ff[cc].Fone++;
+        ff[cc].Ftot++;
+
+        // Update context for next bit (must match encoder)
+        if (ch == 0) {
+            cc = 2 * cc + 1;  // Go left in tree (0 child)
+        } else {
+            cc = 2 * cc + 2;  // Go right in tree (1 child)
+        }
+
+        // Wrap context if we've gone past 255
+        if (cc >= 255)
+            cc = 0;
+    }
+
+    // Display end-of-stream marker for verification
+    fprintf(stderr, "\n EOS = ");
+    fcount = Half;
+
+    if (freeend == 0)
+        fprintf(stderr, " { NULL } ");
+
+    // Show the free end value that was detected
+    for (; freeend != 0; fcount >>= 1) {
+        ch = (fcount & freeend) != 0 ? 1 : 0;
+        if (ch == 1) {
+            fprintf(stderr, "1");
+            freeend -= fcount;
+        } else {
+            fprintf(stderr, "0");
+        }
+    }
+
+    fprintf(stderr, " SUCCESSFUL \n");
+    if (FRXX == 1)
+        fprintf(stderr, "BUT USED HIGH FREEENDS");
 }

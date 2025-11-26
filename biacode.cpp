@@ -27,9 +27,9 @@ int usage()
 
     cerr << endl << "Bijective arithmetic encoder V1.2" << endl
          << "Copyright (C) 1999, Matt Timmermans" << endl << endl;
-    cerr << "USAGE: " << s << " [-d] [-b <blocksize>] <infile> <outfile>" << endl << endl;
-    cerr << "  -d:  decompress (default is compress)" << endl;
-    cerr << "  -b n: compressed blocksize to n bytes (default is 1)" << endl << endl;
+    cerr << "USAGE: " << s << " c|d <infile> <outfile>" << endl << endl;
+    cerr << "  c:  compress" << endl;
+    cerr << "  d:  decompress" << endl << endl;
     return 100;
 }
 
@@ -39,7 +39,6 @@ int main(int argc, char **argv)
 {
     char *s;
     bool decomp = false;
-    bool test = false;
     int blocksize = 1;
 
     // Parse program name
@@ -50,66 +49,31 @@ int main(int argc, char **argv)
         _callname = "biacode";
     }
 
-    // Parse command-line options
-    while (argc && (s = *argv) && (*s++ == '-')) {
-        if (!*s)
-            return usage();
-        --argc;
-        ++argv;
-
-        while (*s) {
-            switch (*s++) {
-            case 'd':
-            case 'D':
-                decomp = true;
-                break;
-
-            case 'T':
-                test = true;
-                break;
-
-            case 'b':
-            case 'B':
-                if (!*s) {
-                    if (!(argc && (s = *argv)))
-                        return usage();
-                    --argc;
-                    ++argv;
-                }
-                blocksize = atoi(s);
-                for (; *s; s++);
-                if (blocksize < 1)
-                    return usage();
-                break;
-
-            default:
-                return usage();
-            }
-        }
-    }
-
-    // Run self-test if requested
-    if (test) {
-        if (argc)
-            return usage();
-        return Test();
-    }
-
-    // Require exactly two file arguments
-    if (argc != 2)
+    // Require exactly 3 arguments: mode, input file, output file
+    if (argc != 3)
         return usage();
+
+    // Parse compression mode
+    s = argv[0];
+    if (*s == 'c' || *s == 'C') {
+        decomp = false;
+    } else if (*s == 'd' || *s == 'D') {
+        decomp = true;
+    } else {
+        return usage();
+    }
 
     // Open input and output files
     {
-        ifstream infile(argv[0], ios::in | ios::binary);
+        ifstream infile(argv[1], ios::in | ios::binary);
         if (infile.fail()) {
-            cerr << "Could not read file \"" << argv[0] << endl;
+            cerr << "Could not read file \"" << argv[1] << endl;
             return 10;
         }
 
-        ofstream outfile(argv[1], ios::out | ios::binary);
+        ofstream outfile(argv[2], ios::out | ios::binary);
         if (outfile.fail()) {
-            cerr << "Could not write file \"" << argv[1] << endl;
+            cerr << "Could not write file \"" << argv[2] << endl;
             return 10;
         }
 
